@@ -11,6 +11,7 @@ import {
   serverTimestamp,
   runTransaction,
   onDisconnect,
+  update, // Added import
   off,
   get,
   DatabaseReference,
