@@ -225,7 +225,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
         const isAlreadyOnline = currentMembers[memberId]?.online === true;
 
         // Count currently online members *excluding* the joining user if they were previously offline or not present
-        const onlineMemberCount = Object.values(currentMembers).filter((m: any) => m?.online === true && m.id !== memberId).length;
+        const onlineMemberCount = Object.values(currentMembers || {}).filter((m: any) => m?.online === true && m.id !== memberId).length;
         const potentialCount = onlineMemberCount + 1; // Count if the current user joins/becomes online
 
         console.log(`Transaction: Current online count (excluding ${memberId}): ${onlineMemberCount}, Potential count: ${potentialCount}, Is already online: ${isAlreadyOnline}, Max Members: ${MAX_MEMBERS}`);
@@ -320,7 +320,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
         // Check for maxretry error specifically
        if (err.message && err.message.toLowerCase().includes('maxretry')) {
             setError(`Failed to join room ${roomCode} due to high contention. Please try again.`);
-            console.error("Join room failed with maxretry error. This likely indicates too many users trying to join at once or transaction conflicts.");
+            // console.error("Join room failed with maxretry error. This likely indicates too many users trying to join at once or transaction conflicts."); // Removed redundant console log
        } else {
            setError(`Failed to join room ${roomCode}: ${err.message}`);
        }
