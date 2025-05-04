@@ -69,9 +69,9 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
         inputRef.current?.focus(); // Focus input after successful join
       } else {
         // joinRoom failed (room full, doesn't exist, or other error handled internally)
-        console.error(`Failed to join room ${roomCode}.`);
         // The error message should be set by the context, retrieve it if available
         const currentError = chatError; // Get error from context *after* join attempt
+        console.error(`Failed to join room ${roomCode}. Reason: ${currentError || 'Context error not available immediately, check toast/UI or context logs.'}`);
         setJoinError(currentError || `Could not join room ${roomCode}. It might be full, deleted, or unavailable.`);
         toast({
           variant: "destructive",
