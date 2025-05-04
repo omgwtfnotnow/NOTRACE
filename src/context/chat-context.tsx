@@ -21,7 +21,7 @@ import { useFirebase } from './firebase-context';
 import { generateRandomName } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 
-const MAX_MEMBERS = 8; // Value is already 8
+const MAX_MEMBERS = 8; // Define maximum members for a room
 const MEMBER_INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
 
 export interface Message {
@@ -247,6 +247,9 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
          if (onlineMemberCount >= MAX_MEMBERS && !isAlreadyOnline) {
            console.warn(`[Join Attempt ${attemptId} - TXN] Aborting: Room full.`);
+           // Set error state before aborting transaction
+           // Note: This error might be overwritten if another error occurs later, but sets a default reason.
+           setError(`Room ${roomCode} is full.`);
            return undefined; // Abort transaction
          }
 
@@ -276,7 +279,10 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
        // --- Process Transaction Result ---
        if (!transactionResult.committed) {
          console.error(`[Join Attempt ${attemptId}] Transaction failed to commit for room ${roomCode}. Likely reason: Room full or high contention.`);
-         setError(`Failed to join room ${roomCode}. The room might be full or experiencing high traffic. Please try again.`);
+         // If setError wasn't already set (e.g., by the room full check), set a generic failure message.
+         if (!error) { // Check if an error message is already set
+             setError(`Failed to join room ${roomCode}. The room might be full or experiencing high traffic. Please try again.`);
+         }
          currentRoomCode.current = null; // Reset room code ref
          setLoading(false);
          return false;
@@ -385,7 +391,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
         // Improved error handling for maxretry
         if (err.code === 'maxretry' || (err.message && err.message.toLowerCase().includes('maxretry'))) {
             specificError = `Failed to join room ${roomCode}. The room might be full or busy. Please try again shortly.`;
-            console.error("[Join Attempt ${attemptId}] Join room failed specifically due to maxretry.");
+            console.error(`[Join Attempt ${attemptId}] Join room failed specifically due to maxretry.`);
         }
        setError(specificError);
        cleanupListeners(); // Ensure cleanup on any error
@@ -394,7 +400,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
        setLoading(false);
        return false;
      }
-   }, [db, currentUser, loading, cleanupListeners, getRoomRef, getMembersRef, getUserRef, getMessagesRef, toast, setError]); // Added loading, setError
+   }, [db, currentUser, loading, error, cleanupListeners, getRoomRef, getMembersRef, getUserRef, getMessagesRef, toast, setError]); // Added loading, error, setError
 
 
    const leaveRoom = React.useCallback(async (roomCode: string): Promise<void> => {
@@ -433,11 +439,10 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
             console.warn(`Could not cancel onDisconnect: ${cancelError.message}`);
         }
 
-        // 2. Mark user offline (or remove)
+        // 2. Mark user offline
         try {
             await update(userRef, { online: false, lastSeen: serverTimestamp() });
             console.log(`User ${userId} marked as offline.`);
-            // Or: await remove(userRef); console.log(`User ${userId} removed.`);
         } catch (updateError: any) {
             console.warn(`Could not mark user ${userId} offline: ${updateError.message}`);
         }
@@ -562,7 +567,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
        // Only run if DB connected and in a room
       if (!db || !currentCheckedRoom) return;
 
-      console.log(`Running inactivity check for room: ${currentCheckedRoom}`);
+      // console.log(`Running inactivity check for room: ${currentCheckedRoom}`); // Can be noisy
       const membersRef = getMembersRef(currentCheckedRoom);
 
 
@@ -570,12 +575,12 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
         const snapshot = await get(membersRef);
         // If the room code changed while we were fetching, abort this check
         if (currentRoomCode.current !== currentCheckedRoom) {
-          console.log("Inactivity check aborted: Room changed during fetch.");
+          // console.log("Inactivity check aborted: Room changed during fetch."); // Can be noisy
           return;
         }
 
         if (!snapshot.exists()) {
-           console.log(`Inactivity check: Room ${currentCheckedRoom} does not exist or is empty.`);
+           // console.log(`Inactivity check: Room ${currentCheckedRoom} does not exist or is empty.`); // Can be noisy
            // If the *local user* thought they were in this room, trigger leave state
            if (currentLocalUser && currentRoomCode.current === currentCheckedRoom) {
               console.warn(`Inactivity check found current room ${currentCheckedRoom} deleted. Forcing local leave.`);
@@ -601,7 +606,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
                 console.log(`Scheduling removal of ${reason} member ${member.name} (${memberId}). Last seen: ${new Date(member.lastSeen).toISOString()}`);
                 membersToRemove.push(memberId);
             }
-          } else if (member) {
+          } else if (member && typeof member.lastSeen !== 'object') { // Ignore server timestamps
              console.warn(`Member ${member.name} (${memberId}) has invalid 'lastSeen':`, member.lastSeen);
           }
         }
@@ -635,7 +640,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
         // Avoid setting global error for background task failures
         console.error(`Error during inactivity check for room ${currentCheckedRoom}:`, err.message || err);
       }
-    }, MEMBER_INACTIVITY_TIMEOUT); // Check more frequently, e.g., every minute
+    }, MEMBER_INACTIVITY_TIMEOUT / 2); // Check more frequently, e.g., every 2.5 minutes
 
     return () => clearInterval(interval);
     // Depends on DB, user (to check if *they* need cleanup), and the leave/cleanup functions
