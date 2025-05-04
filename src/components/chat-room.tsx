@@ -1,4 +1,3 @@
-
 'use client';
 
 import * as React from 'react';
@@ -33,7 +32,7 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
     messages,
     members,
     currentUser,
-    roomExists, // Keep for potential future use, but joinRoom handles existence now
+    // roomExists, // Keep for potential future use, but joinRoom handles existence now
     loading: chatLoading, // Rename to avoid conflict
     error: chatError, // Rename to avoid conflict
   } = useChat();
@@ -59,32 +58,50 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
 
     const attemptJoin = async () => {
       console.log(`Attempting to join room: ${roomCode}`);
-      const joinedSuccessfully = await joinRoom(roomCode);
+      try {
+        const joinedSuccessfully = await joinRoom(roomCode);
 
-      if (!isMounted) return; // Don't update state if unmounted
+        if (!isMounted) return; // Don't update state if unmounted
 
-      if (joinedSuccessfully) {
-        console.log(`Successfully joined room ${roomCode}. Focusing input.`);
-        setIsJoining(false);
-        inputRef.current?.focus(); // Focus input after successful join
-      } else {
-        // joinRoom failed (room full, doesn't exist, or other error handled internally)
-        // The error message should be set by the context, retrieve it if available
-        const currentContextError = chatError; // Get error from context *after* join attempt
-        const failureReason = currentContextError || `Could not join room ${roomCode}. It might be full, deleted, or unavailable.`;
-        console.error(`Failed to join room ${roomCode}. Reason: ${failureReason}`);
-        setJoinError(failureReason);
-        toast({
-          variant: "destructive",
-          title: "Failed to Join Room",
-          description: failureReason + " Redirecting...",
-          duration: 5000, // Give user time to read before redirect
-        });
-        setIsJoining(false); // Stop showing joining indicator
-        // Redirect after a short delay to allow toast visibility
-        setTimeout(() => {
+        if (joinedSuccessfully) {
+          console.log(`Successfully joined room ${roomCode}. Focusing input.`);
+          setIsJoining(false);
+          setJoinError(null); // Clear any lingering join errors
+          inputRef.current?.focus(); // Focus input after successful join
+        } else {
+          // joinRoom returned false, meaning join failed (room full, doesn't exist, etc.)
+          // The context should have set an error message.
+           const failureReason = chatError || `Could not join room ${roomCode}. It might be full, deleted, or unavailable.`;
+           console.error(`Failed to join room ${roomCode}. Reason from context (or default): ${failureReason}`);
+           setJoinError(failureReason); // Use the error from context
+           toast({
+             variant: "destructive",
+             title: "Failed to Join Room",
+             description: failureReason + " Redirecting...",
+             duration: 5000, // Give user time to read before redirect
+           });
+           setIsJoining(false); // Stop showing joining indicator
+           // Redirect after a short delay to allow toast visibility
+           setTimeout(() => {
+              if (isMounted) router.push('/');
+           }, 3000);
+        }
+      } catch (error: any) {
+         // Catch errors thrown by joinRoom itself (e.g., DB not init)
+         if (!isMounted) return;
+         console.error(`Error thrown during joinRoom attempt for ${roomCode}:`, error);
+         const failureReason = error.message || `An unexpected error occurred while trying to join room ${roomCode}.`;
+         setJoinError(failureReason);
+         toast({
+           variant: "destructive",
+           title: "Error Joining Room",
+           description: failureReason + " Redirecting...",
+           duration: 5000,
+         });
+         setIsJoining(false);
+         setTimeout(() => {
            if (isMounted) router.push('/');
-        }, 3000);
+         }, 3000);
       }
     };
 
@@ -96,8 +113,7 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
        // Leave room logic is now handled by the ChatProvider's unmount effect
        // and the beforeunload handler
     };
-    // Include chatError to react to context-level errors, but be mindful of potential loops.
-   }, [roomCode, joinRoom, router, toast, chatError]);
+   }, [roomCode, joinRoom, router, toast, chatError]); // Re-added chatError to react to context updates
 
 
    // --- Handle Browser Close/Navigation ---
@@ -136,11 +152,13 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
    useEffect(() => {
     // Handle errors that might occur *after* joining (e.g., listener errors)
     // Ignore errors during the initial join phase as they are handled separately
-    if (chatError && !isJoining && !joinError) { // Check !joinError to avoid duplicate redirects/toasts
+    // Also ignore errors if we already have a specific joinError set.
+    if (chatError && !isJoining && !joinError) {
+      console.warn(`Chat context error occurred after joining: ${chatError}`);
       toast({
         variant: "destructive",
         title: "Room Error",
-        description: `An error occurred: ${chatError}. Redirecting...`,
+        description: `An error occurred: ${chatError}. You might be disconnected. Redirecting...`,
       });
        // Redirect if a persistent error occurs after joining
       setTimeout(() => router.push('/'), 3000);
@@ -183,6 +201,7 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
       // Redirect happens implicitly as currentUser becomes null,
       // or ChatProvider effect might handle it. Explicit redirect for certainty.
       router.push('/');
+      toast({ title: "Left Room", description: `You have left room ${roomCode}.`}); // Add confirmation toast
     } catch (err: any) {
       console.error('Error leaving room:', err);
       toast({
@@ -251,27 +270,20 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
   };
 
    // --- Render Loading State ---
-   if (isJoining || chatLoading) {
+   if (isJoining || chatLoading) { // Show loading if component state is joining OR context is loading
     return (
       <div className="flex flex-col items-center justify-center h-full p-8 text-center">
         <Loader2 className="h-16 w-16 animate-spin text-primary mb-4" />
         <p className="text-lg font-semibold text-foreground">Joining room {roomCode}...</p>
         <p className="text-muted-foreground">Please wait while we connect you.</p>
-        {joinError && ( // Show specific join error if it occurred
-           <div className="mt-4 p-3 bg-destructive/10 border border-destructive/30 rounded-md text-destructive max-w-md">
-             <div className="flex items-center gap-2 font-semibold">
-               <AlertTriangle className="h-5 w-5"/> Join Failed
-             </div>
-             <p className="text-sm mt-1">{joinError}</p>
-           </div>
-         )}
+        {/* Don't show joinError here, wait for the final error state render */}
       </div>
     );
   }
 
   // --- Render Room Not Found or Join Error State ---
-   if (!currentUser && !isJoining) {
-     // This state means joining finished, but currentUser is null (join failed or user left)
+   // This state triggers if joining finished (isJoining=false) BUT currentUser is still null OR joinError is set.
+   if ((!currentUser && !isJoining) || joinError) {
      return (
        <div className="flex flex-col items-center justify-center h-full p-8 text-center">
          <AlertTriangle className="h-16 w-16 text-destructive mb-4" />
@@ -288,15 +300,15 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
 
 
   // --- Render Main Chat Room ---
+   // Safeguard: If loading is done, join error is not set, but user is somehow still null.
    if (!currentUser) {
-     // Should technically not be reached if above conditions are correct, but acts as a safeguard
-     console.error("ChatRoom render reached without currentUser after loading/joining checks.");
+     console.error("ChatRoom render reached without currentUser after loading/joining/error checks.");
      return (
         <div className="flex flex-col items-center justify-center h-full p-8 text-center">
             <AlertTriangle className="h-16 w-16 text-destructive mb-4" />
-            <p className="text-xl font-semibold text-destructive">Connection Lost</p>
+            <p className="text-xl font-semibold text-destructive">Connection Issue</p>
             <p className="text-muted-foreground mt-2 max-w-md">
-              There was an issue maintaining the connection. Please try rejoining.
+              There was an issue establishing your connection. Please try rejoining.
             </p>
             <Button onClick={() => router.push('/')} className="mt-6">
               Go Back Home
@@ -489,3 +501,4 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
      </TooltipProvider>
   );
 }
+
