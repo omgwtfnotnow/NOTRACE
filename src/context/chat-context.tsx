@@ -1,3 +1,4 @@
+
 'use client';
 
 import * as React from 'react';
@@ -178,6 +179,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
        setError("Database not initialized");
        return false;
      }
+     roomCode = roomCode.toUpperCase(); // Ensure consistency
      if (currentRoomCode.current === roomCode && currentUser) {
        console.log("Already in room:", roomCode);
        setLoading(false); // Already joined
@@ -187,7 +189,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
      setLoading(true);
      setError(null);
      cleanupListeners(); // Clean up previous listeners before joining a new room
-     currentRoomCode.current = roomCode.toUpperCase(); // Store current room
+     currentRoomCode.current = roomCode; // Store current room
 
      try {
        const roomRef = getRoomRef(roomCode);
@@ -202,7 +204,8 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
        }
 
        const membersRef = getMembersRef(roomCode);
-       const memberId = currentUser?.id || `user_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+       // Ensure memberId is generated consistently, even if currentUser briefly exists from a previous failed attempt
+       const memberId = `user_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
        const userName = generateRandomName();
        const userRef = getUserRef(roomCode, memberId);
 
@@ -210,24 +213,40 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
        // Transaction to ensure atomicity and check member count
        const transactionResult = await runTransaction(membersRef, (currentMembers) => {
-         if (currentMembers === null) {
-           currentMembers = {}; // Initialize if null
-         }
-         const memberCount = Object.values(currentMembers).filter((m: any) => m?.online).length; // Count only online members
+        console.log(`Transaction attempting for user: ${memberId} in room: ${roomCode}`); // Add logging
 
-         if (memberCount >= MAX_MEMBERS && !currentMembers[memberId]?.online) {
-           // Room is full and the current user is not already marked as online
-           console.warn(`Room ${roomCode} is full. Cannot join.`);
-           return; // Abort transaction
-         }
+        // Initialize if null
+        if (currentMembers === null) {
+          console.log("Transaction: Initializing members node.");
+          currentMembers = {};
+        }
 
-         currentMembers[memberId] = newUser; // Add or update user
-         return currentMembers;
+        // Check if the user trying to join is *already* in the list and marked online (should generally not happen with new ID, but good practice)
+        const isAlreadyOnline = currentMembers[memberId]?.online === true;
+
+        // Count currently online members *excluding* the joining user if they were previously offline or not present
+        const onlineMemberCount = Object.values(currentMembers).filter((m: any) => m?.online === true && m.id !== memberId).length;
+        const potentialCount = onlineMemberCount + 1; // Count if the current user joins/becomes online
+
+        console.log(`Transaction: Current online count (excluding ${memberId}): ${onlineMemberCount}, Potential count: ${potentialCount}, Is already online: ${isAlreadyOnline}, Max Members: ${MAX_MEMBERS}`);
+
+        if (!isAlreadyOnline && potentialCount > MAX_MEMBERS) {
+          // Room is full, and this user joining would exceed the limit
+          console.warn(`Transaction Aborted: Room full. Potential count ${potentialCount} exceeds MAX_MEMBERS ${MAX_MEMBERS}.`);
+          return; // Abort transaction - return undefined
+        }
+
+        // Proceed to add/update the user
+        console.log(`Transaction OK: Adding/updating user ${memberId} with data:`, newUser);
+        currentMembers[memberId] = newUser; // Add or update user (marks them online)
+        return currentMembers; // Commit transaction
        });
 
-       if (!transactionResult.committed) {
-           setError(`Room ${roomCode} is full.`);
-           console.warn(`Join transaction aborted for room ${roomCode}, likely full.`);
+
+       if (!transactionResult.committed || !transactionResult.snapshot.exists()) {
+           // The transaction was aborted (likely due to room full condition checked inside) or failed for other reasons
+           setError(`Room ${roomCode} is full or join failed.`); // More generic error
+           console.warn(`Join transaction aborted or failed for room ${roomCode}. Committed: ${transactionResult.committed}`);
            currentRoomCode.current = null; // Reset room code ref
            setLoading(false);
            return false;
@@ -251,7 +270,11 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
                ...msg,
              }))
            : [];
-         setMessages(loadedMessages.sort((a, b) => (a.timestamp as number) - (b.timestamp as number))); // Ensure sorting
+         // Sort messages only if they are not empty to avoid errors
+         if (loadedMessages.length > 0) {
+            loadedMessages.sort((a, b) => (a.timestamp as number) - (b.timestamp as number));
+         }
+         setMessages(loadedMessages);
           console.log(`Messages updated for room ${roomCode}:`, loadedMessages.length, "messages");
        }, (err) => {
           console.error(`Messages listener error for room ${roomCode}:`, err);
@@ -271,8 +294,9 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
          console.log(`Members updated for room ${roomCode}:`, loadedMembers.length, "members");
 
          // Check if current user was removed (e.g., kicked or data inconsistency)
-         if (!membersData || !membersData[memberId]) {
-            console.warn(`Current user ${memberId} not found in members list for room ${roomCode}. Leaving room.`);
+         // Ensure currentUser is still defined before checking its id
+         if (currentUser && (!membersData || !membersData[currentUser.id])) {
+            console.warn(`Current user ${currentUser.id} not found in members list for room ${roomCode}. Leaving room.`);
             // Avoid calling leaveRoom directly here to prevent loops if the listener triggers again
             setError("You seem to have been removed from the room.");
             cleanupListeners();
@@ -293,7 +317,13 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
      } catch (err: any) {
        console.error("Error joining room:", err);
-       setError(`Failed to join room ${roomCode}: ${err.message}`);
+        // Check for maxretry error specifically
+       if (err.message && err.message.toLowerCase().includes('maxretry')) {
+            setError(`Failed to join room ${roomCode} due to high contention. Please try again.`);
+            console.error("Join room failed with maxretry error. This likely indicates too many users trying to join at once or transaction conflicts.");
+       } else {
+           setError(`Failed to join room ${roomCode}: ${err.message}`);
+       }
        cleanupListeners(); // Ensure cleanup on error
        setCurrentUser(null); // Clear current user on join failure
        currentRoomCode.current = null; // Reset room code ref
@@ -363,7 +393,8 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
 
   const sendMessage = React.useCallback(async (roomCode: string, text: string): Promise<void> => {
-    if (!db || !currentUser || currentRoomCode.current !== roomCode.toUpperCase()) {
+    roomCode = roomCode.toUpperCase(); // Ensure consistency
+    if (!db || !currentUser || currentRoomCode.current !== roomCode) {
       throw new Error("Cannot send message: Not connected to the room or database.");
     }
     const messagesRef = getMessagesRef(roomCode);
@@ -407,39 +438,67 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
     const interval = setInterval(async () => {
       if (!db || !currentRoomCode.current) return;
 
-      const membersRef = getMembersRef(currentRoomCode.current);
-      const now = Date.now();
+      const currentCheckedRoom = currentRoomCode.current; // Capture the room code at the start of the interval
+      const membersRef = getMembersRef(currentCheckedRoom);
+
 
       try {
         const snapshot = await get(membersRef);
+        // If the room code changed while we were fetching, abort this check
+        if (currentRoomCode.current !== currentCheckedRoom) {
+          console.log("Inactivity check aborted: Room changed during fetch.");
+          return;
+        }
+
         const membersData = snapshot.val();
-        if (!membersData) return;
+        if (!snapshot.exists() || !membersData) {
+           // Room might have been deleted, or is empty
+           console.log(`Inactivity check: Room ${currentCheckedRoom} does not exist or has no members.`);
+           return;
+        }
+
+        const now = Date.now();
+        let membersRemoved = false;
 
         for (const memberId in membersData) {
           const member = membersData[memberId] as Member;
-          // Check only 'offline' members based on the onDisconnect mechanism
-          if (!member.online && typeof member.lastSeen === 'number' && (now - member.lastSeen > MEMBER_INACTIVITY_TIMEOUT)) {
-            console.log(`Removing inactive member ${member.name} (${memberId}) from room ${currentRoomCode.current}`);
-            await remove(getUserRef(currentRoomCode.current, memberId));
+          // Check only 'offline' members based on the onDisconnect mechanism (or very old lastSeen even if online flag is stuck)
+          if (member && typeof member.lastSeen === 'number' && (now - member.lastSeen > MEMBER_INACTIVITY_TIMEOUT)) {
+             if (!member.online) {
+                console.log(`Removing inactive (offline) member ${member.name} (${memberId}) from room ${currentCheckedRoom}. Last seen: ${new Date(member.lastSeen).toISOString()}`);
+                await remove(getUserRef(currentCheckedRoom, memberId));
+                membersRemoved = true;
+             } else {
+                // Optional: Handle cases where 'online' might be stuck true but lastSeen is very old
+                console.warn(`Member ${member.name} (${memberId}) in room ${currentCheckedRoom} is marked online but lastSeen (${new Date(member.lastSeen).toISOString()}) is older than timeout. Consider removing.`);
+                 // await remove(getUserRef(currentCheckedRoom, memberId)); // Uncomment to remove potentially stuck users
+                 // membersRemoved = true;
+             }
           }
         }
 
-         // Also check if the room is now empty after removing inactive members
-         const updatedSnapshot = await get(membersRef);
-         const remainingMembers = updatedSnapshot.val() ? Object.values(updatedSnapshot.val()) : [];
-         if (remainingMembers.length === 0) {
-            console.log(`Room ${currentRoomCode.current} is empty after inactivity check. Deleting room.`);
-             // await remove(getRoomRef(currentRoomCode.current)); // Uncomment to delete room
-             // If room is deleted, we should also clean up local state if the current user was technically still "in" it
-             if (currentRoomCode.current) {
-                 // cleanupListeners(); // Might already be handled if user was marked offline
-                 // setCurrentUser(null);
-                 // currentRoomCode.current = null;
+         // If members were removed, re-check if the room is now empty
+        if(membersRemoved) {
+             const updatedSnapshot = await get(membersRef);
+             // Abort if room changed again
+             if (currentRoomCode.current !== currentCheckedRoom) return;
+
+             const remainingMembers = updatedSnapshot.val() ? Object.values(updatedSnapshot.val()) : [];
+             if (remainingMembers.length === 0) {
+                console.log(`Room ${currentCheckedRoom} is empty after inactivity check. Deleting room.`);
+                 // await remove(getRoomRef(currentCheckedRoom)); // Uncomment to delete room
+                 // If room is deleted, we should also clean up local state if the current user was technically still "in" it
+                 if (currentRoomCode.current === currentCheckedRoom) {
+                     // cleanupListeners(); // Might already be handled if user was marked offline
+                     // setCurrentUser(null);
+                     // currentRoomCode.current = null;
+                 }
              }
-         }
+        }
 
       } catch (err) {
-        console.error("Error during inactivity check:", err);
+        // Avoid setting global error for background task failures
+        console.error(`Error during inactivity check for room ${currentCheckedRoom}:`, err);
       }
     }, MEMBER_INACTIVITY_TIMEOUT / 2); // Check periodically
 
@@ -464,3 +523,5 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
 };
+
+
