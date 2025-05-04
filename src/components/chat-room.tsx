@@ -18,6 +18,9 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Badge } from '@/components/ui/badge';
 
+// Define the constant locally within the component as it's used for display here
+const MAX_MEMBERS = 8;
+
 interface ChatRoomProps {
   roomCode: string;
 }
@@ -92,7 +95,7 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
     };
     // chatError dependency removed here as it might cause loops if errors occur during context operations after join.
     // We explicitly fetch the error *after* the join attempt inside the effect.
-   }, [roomCode, joinRoom, router, toast]); // Keep core dependencies
+   }, [roomCode, joinRoom, router, toast, chatError]); // Added chatError back as it signals context errors
 
 
    // --- Handle Browser Close/Navigation ---
@@ -484,4 +487,3 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
      </TooltipProvider>
   );
 }
-
