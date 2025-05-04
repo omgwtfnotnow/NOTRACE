@@ -213,40 +213,55 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
        // Transaction to ensure atomicity and check member count
        const transactionResult = await runTransaction(membersRef, (currentMembers) => {
-        console.log(`Transaction attempting for user: ${memberId} in room: ${roomCode}`); // Add logging
+        // Attempt number is implicitly handled by Firebase retries, but we can log
+        // Note: The actual retry count isn't directly available inside the function AFAIK.
+        console.log(`Transaction update function running for user: ${memberId} in room: ${roomCode}`);
 
         // Initialize if null
         if (currentMembers === null) {
-          console.log("Transaction: Initializing members node.");
+          console.log(`Transaction: Initializing members node.`);
           currentMembers = {};
+        } else {
+          // Log the state received by this attempt
+          console.log(`Transaction: Received members state keys:`, JSON.stringify(Object.keys(currentMembers)));
         }
 
-        // Check if the user trying to join is *already* in the list and marked online (should generally not happen with new ID, but good practice)
+        // Check if the user trying to join is *already* in the list and marked online
         const isAlreadyOnline = currentMembers[memberId]?.online === true;
 
         // Count currently online members *excluding* the joining user if they were previously offline or not present
-        const onlineMemberCount = Object.values(currentMembers || {}).filter((m: any) => m?.online === true && m.id !== memberId).length;
+        const onlineMembers = Object.values(currentMembers || {}).filter((m: any) => m?.online === true && m.id !== memberId);
+        const onlineMemberCount = onlineMembers.length;
         const potentialCount = onlineMemberCount + 1; // Count if the current user joins/becomes online
 
         console.log(`Transaction: Current online count (excluding ${memberId}): ${onlineMemberCount}, Potential count: ${potentialCount}, Is already online: ${isAlreadyOnline}, Max Members: ${MAX_MEMBERS}`);
+        // Log names of online members for debugging
+        // Careful with logging potentially large amounts of data in production
+        // console.log(`Transaction: Online members names: ${onlineMembers.map((m: any) => m.name).join(', ')}`);
+
 
         if (!isAlreadyOnline && potentialCount > MAX_MEMBERS) {
           // Room is full, and this user joining would exceed the limit
-          console.warn(`Transaction Aborted: Room full. Potential count ${potentialCount} exceeds MAX_MEMBERS ${MAX_MEMBERS}.`);
-          return; // Abort transaction - return undefined
+          console.warn(`Transaction Aborting (condition met): Room full. Potential count ${potentialCount} exceeds MAX_MEMBERS ${MAX_MEMBERS}.`);
+          // Returning undefined signals the SDK to retry if the data has changed since the read.
+          // If the data hasn't changed and this condition is met, it will eventually abort after max retries.
+          return; // Abort *this attempt* if condition met based on current data
         }
 
         // Proceed to add/update the user
-        console.log(`Transaction OK: Adding/updating user ${memberId} with data:`, newUser);
-        currentMembers[memberId] = newUser; // Add or update user (marks them online)
-        return currentMembers; // Commit transaction
+        console.log(`Transaction OK: Proceeding to update user ${memberId}`);
+        // Create a *new* object for the update to avoid modifying the input `currentMembers` directly before returning.
+        const updatedMembers = { ...currentMembers };
+        updatedMembers[memberId] = newUser; // Add or update user (marks them online)
+        return updatedMembers; // Commit transaction with the new state
        });
 
 
        if (!transactionResult.committed || !transactionResult.snapshot.exists()) {
-           // The transaction was aborted (likely due to room full condition checked inside) or failed for other reasons
+           // The transaction was aborted (likely due to max retries or explicit abort) or failed for other reasons
+           const reason = transactionResult.committed ? "failed (snapshot doesn't exist)" : "aborted (likely max retries or explicit abort)";
            setError(`Room ${roomCode} is full or join failed.`); // More generic error
-           console.warn(`Join transaction aborted or failed for room ${roomCode}. Committed: ${transactionResult.committed}`);
+           console.warn(`Join transaction ${reason} for room ${roomCode}. Committed: ${transactionResult.committed}`);
            currentRoomCode.current = null; // Reset room code ref
            setLoading(false);
            return false;
@@ -320,7 +335,6 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
         // Check for maxretry error specifically
        if (err.message && err.message.toLowerCase().includes('maxretry')) {
             setError(`Failed to join room ${roomCode} due to high contention. Please try again.`);
-            // console.error("Join room failed with maxretry error. This likely indicates too many users trying to join at once or transaction conflicts."); // Removed redundant console log
        } else {
            setError(`Failed to join room ${roomCode}: ${err.message}`);
        }
