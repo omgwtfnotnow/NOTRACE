@@ -1,3 +1,4 @@
+
 'use client';
 
 import * as React from 'react';
@@ -9,7 +10,7 @@ import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
-import { Send, LogOut, Download, Users, AlertTriangle, Info } from 'lucide-react';
+import { Send, LogOut, Download, Users, AlertTriangle, Info, Loader2 } from 'lucide-react'; // Added Loader2
 import { useToast } from '@/hooks/use-toast';
 import { format } from 'date-fns';
 import jsPDF from 'jspdf';
@@ -29,12 +30,14 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
     messages,
     members,
     currentUser,
-    roomExists,
-    loading,
-    error,
+    roomExists, // Keep for potential future use, but joinRoom handles existence now
+    loading: chatLoading, // Rename to avoid conflict
+    error: chatError, // Rename to avoid conflict
   } = useChat();
   const [newMessage, setNewMessage] = useState('');
   const [isLeaving, setIsLeaving] = useState(false);
+  const [isJoining, setIsJoining] = useState(true); // Start in joining state
+   const [joinError, setJoinError] = useState<string | null>(null); // Specific state for join errors
   const router = useRouter();
   const { toast } = useToast();
   const scrollAreaRef = useRef<HTMLDivElement>(null);
@@ -45,96 +48,115 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, []);
 
+   // --- Join Room Effect ---
    useEffect(() => {
-    const join = async () => {
-      const joined = await joinRoom(roomCode);
-      if (!joined) {
-        // If joinRoom returns false (e.g., room full or doesn't exist), redirect
+    let isMounted = true; // Flag to prevent state updates on unmounted component
+    setIsJoining(true); // Ensure joining state is active
+    setJoinError(null); // Clear previous join errors
+
+    const attemptJoin = async () => {
+      console.log(`Attempting to join room: ${roomCode}`);
+      const joinedSuccessfully = await joinRoom(roomCode);
+
+      if (!isMounted) return; // Don't update state if unmounted
+
+      if (joinedSuccessfully) {
+        console.log(`Successfully joined room ${roomCode}. Focusing input.`);
+        setIsJoining(false);
+        inputRef.current?.focus(); // Focus input after successful join
+      } else {
+        // joinRoom failed (room full, doesn't exist, or other error handled internally)
+        console.error(`Failed to join room ${roomCode}.`);
+        // The error message should be set by the context, retrieve it if available
+        const currentError = chatError; // Get error from context *after* join attempt
+        setJoinError(currentError || `Could not join room ${roomCode}. It might be full, deleted, or unavailable.`);
         toast({
           variant: "destructive",
           title: "Failed to Join Room",
-          description: `Could not join room ${roomCode}. It might be full or no longer exists.`,
+          description: currentError || `Could not join room ${roomCode}. Redirecting...`,
+          duration: 5000, // Give user time to read before redirect
         });
-        router.push('/');
-      } else {
-         // Focus input after joining
-        inputRef.current?.focus();
+        setIsJoining(false); // Stop showing joining indicator
+        // Redirect after a short delay to allow toast visibility
+        setTimeout(() => router.push('/'), 3000);
       }
     };
-    join();
 
-    // Attempt to scroll down initially and whenever messages/members change
-    scrollToBottom();
+    attemptJoin();
 
-     // Handle user leaving the page (close tab, browser, navigate away)
-    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-      // Note: Standard browsers might not display custom messages here for security reasons.
-      // The primary goal is to trigger the leaveRoom logic.
-      leaveRoom(roomCode);
-      // event.preventDefault(); // Not strictly necessary for cleanup but standard practice
-      // event.returnValue = ''; // For older browsers
+    return () => {
+      isMounted = false; // Mark as unmounted on cleanup
+       console.log("ChatRoom component unmounting or roomCode changing.");
+       // Leave room logic is now handled by the ChatProvider's unmount effect
+       // and the beforeunload handler
     };
+    // chatError dependency removed here as it might cause loops if errors occur during context operations after join.
+    // We explicitly fetch the error *after* the join attempt inside the effect.
+   }, [roomCode, joinRoom, router, toast]); // Keep core dependencies
+
+
+   // --- Handle Browser Close/Navigation ---
+   useEffect(() => {
+     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+       console.log("beforeunload event triggered. Attempting to leave room.");
+       // This is best-effort. Browser might kill the process before async ops complete.
+       // Rely more on onDisconnect and inactivity checks.
+       if (currentUser) { // Check if user actually joined
+         leaveRoom(roomCode);
+       }
+       // Standard practice for older browsers, though modern ones ignore custom messages.
+       // event.preventDefault();
+       // event.returnValue = '';
+     };
 
      window.addEventListener('beforeunload', handleBeforeUnload);
 
+     return () => {
+       window.removeEventListener('beforeunload', handleBeforeUnload);
+     };
+     // Depends on currentUser to know if leaveRoom is necessary
+   }, [leaveRoom, roomCode, currentUser]);
 
-    // Cleanup function for when the component unmounts or roomCode changes
-    return () => {
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-      // Ensure leaveRoom is called if the component unmounts for other reasons
-      // Check if currentUser exists before leaving, as it might be null if join failed
-      if (currentUser) {
-        leaveRoom(roomCode);
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomCode, joinRoom, leaveRoom, router, toast]); // currentUser dependency removed to avoid loop on initial load
 
+  // --- Scroll Effect ---
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, members, scrollToBottom]);
+    // Only scroll if not actively joining (prevents scrolling during initial load)
+    if (!isJoining) {
+      scrollToBottom();
+    }
+  }, [messages, members, scrollToBottom, isJoining]); // Add isJoining dependency
 
-  useEffect(() => {
-    if (error) {
+
+  // --- General Error Handling (from context after join) ---
+   useEffect(() => {
+    // Handle errors that might occur *after* joining (e.g., listener errors)
+    // Ignore errors during the initial join phase as they are handled separately
+    if (chatError && !isJoining && !joinError) {
       toast({
         variant: "destructive",
         title: "Room Error",
-        description: error,
+        description: `An error occurred: ${chatError}. Redirecting...`,
       });
-      router.push('/');
+       // Redirect if a persistent error occurs after joining
+      setTimeout(() => router.push('/'), 3000);
     }
-  }, [error, router, toast]);
-
-   useEffect(() => {
-    // Check room existence explicitly after initial load or if currentUser becomes null
-    const checkExistence = async () => {
-      if (!loading && !currentUser && !error) {
-        const exists = await roomExists(roomCode);
-        if (!exists) {
-          toast({
-            variant: "destructive",
-            title: "Room Not Found",
-            description: `Room ${roomCode} does not exist.`,
-          });
-          router.push('/');
-        }
-      }
-    };
-    checkExistence();
-   }, [loading, currentUser, roomCode, roomExists, router, toast, error]);
+   }, [chatError, isJoining, joinError, router, toast]);
 
 
   const handleSendMessage = async (e?: React.FormEvent) => {
     e?.preventDefault();
-    if (!newMessage.trim() || !currentUser) return;
+    if (!newMessage.trim() || !currentUser || isLeaving || isJoining) return;
+
+    const messageToSend = newMessage;
+    setNewMessage(''); // Clear input immediately for better UX
 
     try {
-      await sendMessage(roomCode, newMessage);
-      setNewMessage('');
-      scrollToBottom(); // Scroll after sending
+      await sendMessage(roomCode, messageToSend);
+      // scrollToBottom(); // Let the useEffect handle scrolling
        inputRef.current?.focus(); // Keep focus on input
     } catch (err: any) {
       console.error('Error sending message:', err);
+      setNewMessage(messageToSend); // Restore message on error
       toast({
         variant: "destructive",
         title: "Send Error",
@@ -145,11 +167,16 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
 
   const handleLeaveRoom = async (exportChat: boolean) => {
     setIsLeaving(true);
-    if (exportChat) {
-      handleExportChat(); // Export first
+    if (exportChat && messages.length > 0) {
+      handleExportChat(); // Export first if requested and possible
+    } else if (exportChat && messages.length === 0) {
+       toast({ title: "Export Skipped", description: "Chat is empty, nothing to export." });
     }
+
     try {
       await leaveRoom(roomCode);
+      // Redirect happens implicitly as currentUser becomes null,
+      // or ChatProvider effect might handle it. Explicit redirect for certainty.
       router.push('/');
     } catch (err: any) {
       console.error('Error leaving room:', err);
@@ -165,7 +192,7 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
 
   const handleExportChat = () => {
     if (!messages.length) {
-       toast({ title: "Export Failed", description: "Chat is empty." });
+       // Toast handled in handleLeaveRoom if called from there
        return;
     }
 
@@ -173,30 +200,38 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
     pdf.setFontSize(16);
     pdf.text(`NOTRACE Chat - Room: ${roomCode}`, 14, 15);
     pdf.setFontSize(10);
-    pdf.text(`Exported on: ${format(new Date(), 'Pp')}`, 14, 22);
+    pdf.text(`Exported on: ${format(new Date(), 'Pp')} by ${currentUser?.name || 'User'}`, 14, 22);
     pdf.setLineWidth(0.1);
     pdf.line(14, 25, 196, 25); // Separator line
 
     let yPos = 35;
     const pageHeight = pdf.internal.pageSize.height;
     const margin = 15; // Top/bottom margin
+    const lineHeight = 5; // Approximate line height based on font size
+    const spacing = 2; // Space between messages
 
     messages.forEach((msg) => {
-      const timestamp = msg.timestamp ? format(new Date(msg.timestamp), 'p') : 'Sending...';
+      const timestamp = typeof msg.timestamp === 'number' ? format(new Date(msg.timestamp), 'p') : 'Sending...';
       const senderName = members.find(m => m.id === msg.senderId)?.name || 'Unknown';
-      const messageLine = `[${timestamp}] ${senderName}: ${msg.text}`;
+      // Sanitize text slightly for PDF (basic example)
+      const messageText = msg.text.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const messageLine = `[${timestamp}] ${senderName}: ${messageText}`;
+
 
       // Split lines manually to handle wrapping
-      const splitLines = pdf.splitTextToSize(messageLine, 180); // Adjust width as needed (page width - margins)
+      const splitLines = pdf.splitTextToSize(messageLine, 180); // Page width - margins
+      const messageHeight = splitLines.length * lineHeight;
 
-      if (yPos + (splitLines.length * 5) > pageHeight - margin) { // Check if content exceeds page height
+      // Check if content exceeds page height before adding it
+      if (yPos + messageHeight > pageHeight - margin) {
         pdf.addPage();
         yPos = margin; // Reset Y position for new page
-         pdf.line(14, margin - 5, 196, margin - 5); // Separator line at top of new page
+         // Optional: Add header to new page if needed
+         // pdf.line(14, margin - 5, 196, margin - 5); // Separator line at top of new page
       }
 
       pdf.text(splitLines, 14, yPos);
-      yPos += (splitLines.length * 5) + 2; // Increment Y position (line height + spacing)
+      yPos += messageHeight + spacing; // Increment Y position
     });
 
 
@@ -210,37 +245,97 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
 
   };
 
-
-  if (loading || !currentUser) {
+   // --- Render Loading State ---
+   if (isJoining || chatLoading) {
     return (
-      <div className="flex flex-col items-center justify-center h-full">
-        <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-primary mb-4"></div>
-        <p className="text-muted-foreground">Joining room {roomCode}...</p>
+      <div className="flex flex-col items-center justify-center h-full p-8 text-center">
+        <Loader2 className="h-16 w-16 animate-spin text-primary mb-4" />
+        <p className="text-lg font-semibold text-foreground">Joining room {roomCode}...</p>
+        <p className="text-muted-foreground">Please wait while we connect you.</p>
+        {joinError && ( // Show specific join error if it occurred
+           <div className="mt-4 p-3 bg-destructive/10 border border-destructive/30 rounded-md text-destructive max-w-md">
+             <div className="flex items-center gap-2 font-semibold">
+               <AlertTriangle className="h-5 w-5"/> Join Failed
+             </div>
+             <p className="text-sm mt-1">{joinError}</p>
+           </div>
+         )}
       </div>
     );
   }
 
+  // --- Render Room Not Found or Join Error State ---
+   if (!currentUser && !isJoining) {
+     // This state means joining finished, but currentUser is null (join failed or user left)
+     return (
+       <div className="flex flex-col items-center justify-center h-full p-8 text-center">
+         <AlertTriangle className="h-16 w-16 text-destructive mb-4" />
+         <p className="text-xl font-semibold text-destructive">Could Not Enter Room</p>
+          <p className="text-muted-foreground mt-2 max-w-md">
+           {joinError || chatError || `Unable to join room ${roomCode}. It might be full, deleted, or you might have been disconnected.`}
+         </p>
+         <Button onClick={() => router.push('/')} className="mt-6">
+            Go Back Home
+          </Button>
+       </div>
+     );
+   }
+
+
+  // --- Render Main Chat Room ---
+   if (!currentUser) {
+     // Should technically not be reached if above conditions are correct, but acts as a safeguard
+     console.error("ChatRoom render reached without currentUser after loading/joining checks.");
+     return (
+        <div className="flex flex-col items-center justify-center h-full p-8 text-center">
+            <AlertTriangle className="h-16 w-16 text-destructive mb-4" />
+            <p className="text-xl font-semibold text-destructive">Connection Lost</p>
+            <p className="text-muted-foreground mt-2 max-w-md">
+              There was an issue maintaining the connection. Please try rejoining.
+            </p>
+            <Button onClick={() => router.push('/')} className="mt-6">
+              Go Back Home
+            </Button>
+        </div>
+        );
+   }
+
+
+  // Main chat interface rendered only if currentUser is confirmed
   return (
     <TooltipProvider>
     <Card className="w-full h-[85vh] max-h-[900px] flex flex-col shadow-lg border border-border bg-card">
       <CardHeader className="flex flex-row items-center justify-between p-4 border-b">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 overflow-hidden"> {/* Added overflow-hidden */}
            <CardTitle className="text-xl md:text-2xl font-semibold text-primary truncate">Room: {roomCode}</CardTitle>
            <Tooltip>
             <TooltipTrigger asChild>
-              <Badge variant="secondary" className="cursor-help">
-                <Users className="h-4 w-4 mr-1" /> {members.length} / 8
+              <Badge variant="secondary" className="cursor-help flex-shrink-0"> {/* Added flex-shrink-0 */}
+                <Users className="h-4 w-4 mr-1" /> {members.filter(m => m.online).length} / {MAX_MEMBERS}
               </Badge>
             </TooltipTrigger>
             <TooltipContent side="bottom">
-              <p className="font-semibold mb-1">Members:</p>
-              <ul className="list-disc list-inside text-sm">
-                {members.map(m => <li key={m.id}>{m.name} {m.id === currentUser.id ? '(You)' : ''}</li>)}
+              <p className="font-semibold mb-1">Online Members ({members.filter(m => m.online).length}):</p>
+              <ul className="list-disc list-inside text-sm max-h-40 overflow-y-auto">
+                 {members.filter(m => m.online).length === 0 && <li>No one else is here.</li>}
+                {members.filter(m => m.online).map(m => (
+                    <li key={m.id}>{m.name} {m.id === currentUser.id ? '(You)' : ''}</li>
+                 ))}
+                 {members.filter(m => !m.online).length > 0 && (
+                    <>
+                    <hr className="my-1"/>
+                    <p className="font-semibold my-1 text-muted-foreground">Offline:</p>
+                    {members.filter(m => !m.online).map(m => (
+                     <li key={m.id} className="text-muted-foreground/80">{m.name}</li>
+                    ))}
+                    </>
+                 )}
+
               </ul>
             </TooltipContent>
           </Tooltip>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-shrink-0"> {/* Added flex-shrink-0 */}
             <Tooltip>
             <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon" onClick={handleExportChat} disabled={isLeaving || messages.length === 0}>
@@ -258,7 +353,7 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
                <TooltipTrigger asChild>
                 <AlertDialogTrigger asChild>
                     <Button variant="destructive" size="icon" disabled={isLeaving}>
-                      <LogOut className="h-5 w-5" />
+                      {isLeaving ? <Loader2 className="h-5 w-5 animate-spin" /> : <LogOut className="h-5 w-5" />}
                       <span className="sr-only">Leave Room</span>
                     </Button>
                 </AlertDialogTrigger>
@@ -269,25 +364,27 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
               <AlertDialogHeader>
                 <AlertDialogTitle>Leave Room?</AlertDialogTitle>
                 <AlertDialogDescription>
-                  Are you sure you want to leave the room? Your chat history in this room will be lost unless you export it.
+                  Are you sure you want to leave the room? Your chat history in this room will be lost unless you export it first.
                 </AlertDialogDescription>
               </AlertDialogHeader>
-              <AlertDialogFooter className="flex-col sm:flex-row gap-2 mt-2">
-                 <AlertDialogAction
-                   onClick={() => handleLeaveRoom(true)} // Leave AND Export
+              <AlertDialogFooter className="flex-col sm:flex-row gap-2 mt-4">
+                 <Button
+                   onClick={() => handleLeaveRoom(true)}
                    className="w-full sm:w-auto"
                    disabled={isLeaving || messages.length === 0}
+                   variant="outline"
                  >
-                   <Download className="mr-2 h-4 w-4"/> Export & Leave
-                 </AlertDialogAction>
-                 <AlertDialogAction
-                   onClick={() => handleLeaveRoom(false)} // Leave WITHOUT Export
+                   <Download className="mr-2 h-4 w-4"/> {messages.length === 0 ? "Chat Empty" : "Export & Leave"}
+                 </Button>
+                 <Button
+                   onClick={() => handleLeaveRoom(false)}
                    variant="destructive"
                    className="w-full sm:w-auto"
                    disabled={isLeaving}
                  >
-                   <LogOut className="mr-2 h-4 w-4"/> Leave Without Export
-                 </AlertDialogAction>
+                  {isLeaving ? <Loader2 className="mr-2 h-4 w-4 animate-spin"/> : <LogOut className="mr-2 h-4 w-4"/>}
+                   Leave Without Export
+                 </Button>
                  <AlertDialogCancel className="w-full sm:w-auto mt-2 sm:mt-0" disabled={isLeaving}>Cancel</AlertDialogCancel>
               </AlertDialogFooter>
             </AlertDialogContent>
@@ -297,48 +394,61 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
 
       <CardContent ref={scrollAreaRef} className="flex-grow p-0 overflow-hidden">
           <ScrollArea className="h-full w-full p-4">
-             {messages.length === 0 && (
-              <div className="flex flex-col items-center justify-center h-full text-muted-foreground text-center">
-                <Info className="h-8 w-8 mb-2"/>
-                <p className="font-semibold">Welcome to the room!</p>
-                <p className="text-sm">Messages you send will appear here.</p>
-                <p className="text-xs mt-4">Remember: Chats are ephemeral and not stored long-term.</p>
+             {messages.length === 0 && !isJoining && ( // Show welcome only after joining and if no messages
+              <div className="flex flex-col items-center justify-center h-full text-muted-foreground text-center px-4">
+                <Info className="h-10 w-10 mb-3 text-primary"/>
+                <p className="text-lg font-semibold text-foreground">Welcome, {currentUser.name}!</p>
+                <p className="text-sm">You're in room <span className="font-mono text-primary">{roomCode}</span>.</p>
+                <p className="text-sm mt-2">Messages you send will appear here. Start chatting!</p>
+                <p className="text-xs mt-6 bg-secondary text-secondary-foreground p-2 rounded-md">
+                    Remember: Chats are ephemeral and not stored long-term. Be respectful.
+                </p>
               </div>
             )}
             {messages.map((msg, index) => {
               const sender = members.find(m => m.id === msg.senderId);
               const isCurrentUserMsg = msg.senderId === currentUser.id;
-              const senderName = sender?.name || '...'; // Show ellipsis if member not found yet
+               // Use a more robust fallback if sender is somehow missing after join
+               const senderName = sender?.name || (isCurrentUserMsg ? currentUser.name : 'Unknown User');
               const senderInitial = senderName.charAt(0).toUpperCase();
-               const timestamp = msg.timestamp ? format(new Date(msg.timestamp), 'p') : '...'; // Sending indicator
+               const timestamp = typeof msg.timestamp === 'number'
+                ? format(new Date(msg.timestamp), 'p')
+                : '...'; // Sending indicator
 
-              // Check if the previous message was from the same sender
+
+              // Determine if sender info should be shown (first message or sender change)
               const prevMsg = index > 0 ? messages[index - 1] : null;
               const showSenderInfo = !prevMsg || prevMsg.senderId !== msg.senderId;
+              // Check if timestamp should be shown (last message or significant time gap?)
+               // For simplicity, show timestamp always for now. Could add time gap logic later.
 
               return (
                 <div
-                  key={msg.id || `msg-${index}`} // Use index as fallback key if id isn't available yet
-                  className={`flex mb-3 ${isCurrentUserMsg ? 'justify-end' : 'justify-start'}`}
+                  key={msg.id || `msg-${index}-${msg.timestamp}`} // Better fallback key
+                  className={`flex mb-1 ${isCurrentUserMsg ? 'justify-end' : 'justify-start'}`}
                 >
-                  <div className={`flex items-end gap-2 max-w-[80%] ${isCurrentUserMsg ? 'flex-row-reverse' : 'flex-row'}`}>
+                  <div className={`flex items-start gap-2 max-w-[85%] md:max-w-[75%] ${isCurrentUserMsg ? 'flex-row-reverse' : 'flex-row'}`}>
                      {!isCurrentUserMsg && (
-                      <Avatar className={`h-6 w-6 ${showSenderInfo ? 'opacity-100' : 'opacity-0'}`}>
+                      <Avatar className={`h-6 w-6 mt-1 ${showSenderInfo ? 'opacity-100' : 'opacity-0'}`}>
+                          {/* Add tooltip to avatar? */}
                           <AvatarFallback className="text-xs bg-secondary text-secondary-foreground">{senderInitial}</AvatarFallback>
                       </Avatar>
                      )}
+                     {isCurrentUserMsg && (
+                         <div className="w-6 flex-shrink-0"></div> // Placeholder to align messages
+                     )}
                     <div
-                      className={`flex flex-col rounded-lg px-3 py-2 ${
+                       className={`flex flex-col rounded-lg px-3 py-1.5 shadow-sm ${
                         isCurrentUserMsg
                           ? 'bg-primary text-primary-foreground rounded-br-none'
-                          : 'bg-muted text-muted-foreground rounded-bl-none'
-                      }`}
+                          : 'bg-card border rounded-bl-none' // Use card for non-user messages
+                      } ${showSenderInfo ? 'mt-2' : ''}`} // Add margin top if sender info is shown
                     >
                       {!isCurrentUserMsg && showSenderInfo && (
-                        <p className="text-xs font-semibold mb-1">{senderName}</p>
+                         <p className="text-xs font-semibold mb-0.5 text-primary">{senderName}</p>
                       )}
                       <p className="text-sm break-words whitespace-pre-wrap">{msg.text}</p>
-                      <p className={`text-xs mt-1 ${isCurrentUserMsg ? 'text-primary-foreground/70' : 'text-muted-foreground/70'} text-right`}>
+                       <p className={`text-[10px] mt-1 ${isCurrentUserMsg ? 'text-primary-foreground/70' : 'text-muted-foreground/70'} ${isCurrentUserMsg ? 'text-right' : 'text-left'}`}>
                         {timestamp}
                       </p>
                     </div>
@@ -347,11 +457,11 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
               );
             })}
             {/* Marker div for scrolling */}
-            <div ref={messagesEndRef} />
+            <div ref={messagesEndRef} className="h-1" />
           </ScrollArea>
       </CardContent>
 
-      <CardFooter className="p-4 border-t">
+      <CardFooter className="p-2 border-t">
         <form onSubmit={handleSendMessage} className="flex w-full items-center gap-2">
           <Input
             ref={inputRef}
@@ -360,10 +470,11 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
             value={newMessage}
             onChange={(e) => setNewMessage(e.target.value)}
             className="flex-grow"
-            disabled={isLeaving}
+            disabled={isLeaving || isJoining} // Disable during leaving/joining
             autoComplete="off"
+            maxLength={500} // Add a max length
           />
-          <Button type="submit" size="icon" disabled={!newMessage.trim() || isLeaving}>
+          <Button type="submit" size="icon" disabled={!newMessage.trim() || isLeaving || isJoining}>
             <Send className="h-5 w-5" />
              <span className="sr-only">Send Message</span>
           </Button>
@@ -373,3 +484,4 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
      </TooltipProvider>
   );
 }
+

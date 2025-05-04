@@ -12,7 +12,7 @@ import {
   serverTimestamp,
   runTransaction,
   onDisconnect,
-  update, // Ensure update is imported
+  update,
   off,
   get,
   DatabaseReference,
@@ -213,59 +213,67 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
        // Transaction to ensure atomicity and check member count
        const transactionResult = await runTransaction(membersRef, (currentMembers) => {
-        // Attempt number is implicitly handled by Firebase retries, but we can log
-        // Note: The actual retry count isn't directly available inside the function AFAIK.
-        console.log(`Transaction update function running for user: ${memberId} in room: ${roomCode}`);
+         console.log(`Transaction update attempt for user: ${memberId} in room: ${roomCode}`);
 
-        // Initialize if null
-        if (currentMembers === null) {
-          console.log(`Transaction: Initializing members node.`);
-          currentMembers = {};
-        } else {
-          // Log the state received by this attempt
-          console.log(`Transaction: Received members state keys:`, JSON.stringify(Object.keys(currentMembers)));
-        }
+         // Initialize if null
+         if (currentMembers === null) {
+           currentMembers = {};
+         }
 
-        // Check if the user trying to join is *already* in the list and marked online
-        const isAlreadyOnline = currentMembers[memberId]?.online === true;
+         // Count currently online members
+         const onlineMembers = Object.values(currentMembers || {}).filter((m: any) => m?.online === true);
+         const onlineMemberCount = onlineMembers.length;
 
-        // Count currently online members *excluding* the joining user if they were previously offline or not present
-        const onlineMembers = Object.values(currentMembers || {}).filter((m: any) => m?.online === true && m.id !== memberId);
-        const onlineMemberCount = onlineMembers.length;
-        const potentialCount = onlineMemberCount + 1; // Count if the current user joins/becomes online
+         console.log(`Transaction Check: Current online members: ${onlineMemberCount}, Max Members: ${MAX_MEMBERS}`);
 
-        console.log(`Transaction: Current online count (excluding ${memberId}): ${onlineMemberCount}, Potential count: ${potentialCount}, Is already online: ${isAlreadyOnline}, Max Members: ${MAX_MEMBERS}`);
-        // Log names of online members for debugging
-        // Careful with logging potentially large amounts of data in production
-        // console.log(`Transaction: Online members names: ${onlineMembers.map((m: any) => m.name).join(', ')}`);
+         // Check if room is full *before* attempting to add the new user
+         if (onlineMemberCount >= MAX_MEMBERS) {
+           // Explicitly check if the *joining user* is one of the online members (edge case: rejoining quickly)
+           const alreadyIn = onlineMembers.some((m: any) => m.id === memberId);
+           if (!alreadyIn) {
+             console.warn(`Transaction Aborting: Room full. Online count ${onlineMemberCount} >= MAX_MEMBERS ${MAX_MEMBERS}.`);
+             // Returning undefined tells Firebase the transaction didn't modify data,
+             // allowing it to potentially retry if the data changed. If the room remains full,
+             // it will eventually fail after max retries.
+             return undefined; // Explicitly abort this attempt
+           } else {
+              console.log(`Transaction Note: User ${memberId} seems to be rejoining an already full room they were in. Allowing update.`);
+           }
+         }
 
-
-        if (!isAlreadyOnline && potentialCount > MAX_MEMBERS) {
-          // Room is full, and this user joining would exceed the limit
-          console.warn(`Transaction Aborting (condition met): Room full. Potential count ${potentialCount} exceeds MAX_MEMBERS ${MAX_MEMBERS}.`);
-          // Returning undefined signals the SDK to retry if the data has changed since the read.
-          // If the data hasn't changed and this condition is met, it will eventually abort after max retries.
-          return; // Abort *this attempt* if condition met based on current data
-        }
-
-        // Proceed to add/update the user
-        console.log(`Transaction OK: Proceeding to update user ${memberId}`);
-        // Create a *new* object for the update to avoid modifying the input `currentMembers` directly before returning.
-        const updatedMembers = { ...currentMembers };
-        updatedMembers[memberId] = newUser; // Add or update user (marks them online)
-        return updatedMembers; // Commit transaction with the new state
+         // Proceed to add/update the user
+         console.log(`Transaction OK: Proceeding to add/update user ${memberId}`);
+         // Important: Return a *new* object for the update, don't modify the input `currentMembers` directly.
+         const updatedMembers = { ...currentMembers };
+         updatedMembers[memberId] = newUser; // Add or update user (marks them online)
+         return updatedMembers; // Commit transaction attempt with the new state
        });
 
 
-       if (!transactionResult.committed || !transactionResult.snapshot.exists()) {
-           // The transaction was aborted (likely due to max retries or explicit abort) or failed for other reasons
-           const reason = transactionResult.committed ? "failed (snapshot doesn't exist)" : "aborted (likely max retries or explicit abort)";
-           setError(`Room ${roomCode} is full or join failed.`); // More generic error
-           console.warn(`Join transaction ${reason} for room ${roomCode}. Committed: ${transactionResult.committed}`);
-           currentRoomCode.current = null; // Reset room code ref
-           setLoading(false);
-           return false;
+       // Check the outcome of the transaction
+       if (!transactionResult.committed) {
+         // Transaction failed, likely due to hitting max retries because the room was full
+         // or potentially other database contention issues.
+         console.error(`Join transaction failed to commit for room ${roomCode}. Likely कारण: Room full or high contention.`);
+         setError(`Failed to join room ${roomCode}. The room might be full or experiencing high traffic. Please try again.`);
+         currentRoomCode.current = null; // Reset room code ref
+         setLoading(false);
+         return false;
        }
+        // Additional check: even if committed, verify the user data exists in the snapshot
+       if (!transactionResult.snapshot.child(memberId).exists()) {
+          console.error(`Join transaction committed for room ${roomCode}, but user ${memberId} data is missing in the final snapshot. This indicates a potential issue.`);
+          setError(`An inconsistency occurred while joining room ${roomCode}. Please try again.`);
+          // Attempt cleanup of potentially partial state? Or just leave? Best to leave.
+          try {
+              await remove(userRef); // Try to clean up the potentially orphaned user entry
+          } catch (cleanupError) {
+              console.error("Error trying to clean up user entry after inconsistent transaction:", cleanupError);
+          }
+          currentRoomCode.current = null; // Reset room code ref
+          setLoading(false);
+          return false;
+        }
 
 
        setCurrentUser(newUser); // Set the current user state *after* successful transaction
@@ -305,19 +313,26 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
          const loadedMembers: Member[] = membersData
            ? Object.values(membersData)
            : [];
-         setMembers(loadedMembers.filter(m => m)); // Filter out potentially null entries if deletion is inconsistent
-         console.log(`Members updated for room ${roomCode}:`, loadedMembers.length, "members");
+          const filteredMembers = loadedMembers.filter(m => m); // Filter out potentially null/deleted entries
+
+           // Important: Update members state *before* checking currentUser existence
+           setMembers(filteredMembers);
+           console.log(`Members updated for room ${roomCode}:`, filteredMembers.length, "members");
+
 
          // Check if current user was removed (e.g., kicked or data inconsistency)
-         // Ensure currentUser is still defined before checking its id
-         if (currentUser && (!membersData || !membersData[currentUser.id])) {
-            console.warn(`Current user ${currentUser.id} not found in members list for room ${roomCode}. Leaving room.`);
-            // Avoid calling leaveRoom directly here to prevent loops if the listener triggers again
-            setError("You seem to have been removed from the room.");
-            cleanupListeners();
-            setCurrentUser(null); // Clear current user as they are no longer in the room
-            currentRoomCode.current = null; // Reset room code ref
-            setLoading(false);
+         // Perform this check *after* updating the members state and *only if* currentUser is still set locally
+         if (currentUser) {
+             const stillExists = filteredMembers.some(m => m.id === currentUser.id);
+             if (!stillExists) {
+                 console.warn(`Current user ${currentUser.id} no longer found in members list for room ${roomCode}. Leaving room.`);
+                 setError("You seem to have been removed or disconnected from the room.");
+                 // Avoid calling leaveRoom directly here to prevent loops. Let the component redirect.
+                 cleanupListeners();
+                 setCurrentUser(null); // Clear current user as they are no longer valid in this room
+                 currentRoomCode.current = null; // Reset room code ref
+                 setLoading(false); // Stop loading as the user is effectively out
+             }
          }
 
        }, (err) => {
@@ -331,20 +346,23 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
        return true;
 
      } catch (err: any) {
-       console.error("Error joining room:", err);
-        // Check for maxretry error specifically
-       if (err.message && err.message.toLowerCase().includes('maxretry')) {
-            setError(`Failed to join room ${roomCode} due to high contention. Please try again.`);
+       console.error("General error during joinRoom process:", err);
+       // Check if it's a FirebaseError and potentially contains 'maxretry' or similar codes
+       let specificError = `Failed to join room ${roomCode}: ${err.message}`;
+        if (err.code === 'maxretry' || (err.message && err.message.toLowerCase().includes('maxretry'))) {
+            specificError = `Failed to join room ${roomCode} due to high contention or the room being full. Please try again.`;
+            console.error("Join room failed specifically due to maxretry or related transaction failure.");
        } else {
-           setError(`Failed to join room ${roomCode}: ${err.message}`);
+            console.error(`Join room failed with an unexpected error: ${err.message || err}`);
        }
-       cleanupListeners(); // Ensure cleanup on error
+       setError(specificError);
+       cleanupListeners(); // Ensure cleanup on any error
        setCurrentUser(null); // Clear current user on join failure
        currentRoomCode.current = null; // Reset room code ref
        setLoading(false);
        return false;
      }
-   }, [db, currentUser, cleanupListeners, getRoomRef, getMembersRef, getUserRef, getMessagesRef, toast]); // Added dependencies
+   }, [db, currentUser, cleanupListeners, getRoomRef, getMembersRef, getUserRef, getMessagesRef, toast]); // Ensure all dependencies like `currentUser` are included
 
 
    const leaveRoom = React.useCallback(async (roomCode: string): Promise<void> => {
@@ -367,37 +385,67 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
     try {
       // 1. Cancel the onDisconnect handler first
-      await onDisconnect(userRef).cancel();
-      console.log(`onDisconnect cancelled for ${userId} in room ${roomCode}.`);
+      // Use try-catch as cancel might fail if connection already lost
+      try {
+          await onDisconnect(userRef).cancel();
+          console.log(`onDisconnect cancelled for ${userId} in room ${roomCode}.`);
+      } catch (cancelError: any) {
+          console.warn(`Could not cancel onDisconnect (may already be disconnected): ${cancelError.message}`);
+      }
+
 
       // 2. Mark the user as offline immediately using update
-      await update(userRef, { online: false, lastSeen: serverTimestamp() });
-      console.log(`User ${userId} marked as offline in room ${roomCode}.`);
-      // Option B: Remove the user entirely (simpler state)
-      // await remove(userRef);
-      // console.log(`User ${userId} removed from room ${roomCode}.`);
+      // Use try-catch as this might fail if permissions change or data is corrupt
+      try {
+          await update(userRef, { online: false, lastSeen: serverTimestamp() });
+          console.log(`User ${userId} marked as offline in room ${roomCode}.`);
+      } catch (updateError: any) {
+          console.warn(`Could not mark user ${userId} as offline (may already be removed or connection issue): ${updateError.message}`);
+          // Even if update fails, proceed with cleanup. The user might already be gone.
+      }
+
+      // Option B: Remove the user entirely (alternative to marking offline)
+      // try {
+      //     await remove(userRef);
+      //     console.log(`User ${userId} removed from room ${roomCode}.`);
+      // } catch (removeError: any) {
+      //     console.warn(`Could not remove user ${userId} (may already be removed): ${removeError.message}`);
+      // }
 
 
        // 3. Check if the room should be deleted (optional, based on your logic)
-      const membersSnapshot = await get(membersRef);
-      const remainingMembers = membersSnapshot.val() ? Object.values(membersSnapshot.val()).filter((m: any) => m?.online) : [];
+      // Use try-catch for the read operation as well
+      try {
+          const membersSnapshot = await get(membersRef);
+          // Check if snapshot exists before trying to get value
+          if (membersSnapshot.exists()) {
+              const membersData = membersSnapshot.val();
+              // Filter members who are explicitly marked as online
+              const remainingOnlineMembers = membersData ? Object.values(membersData).filter((m: any) => m?.online === true) : [];
 
-      if (remainingMembers.length === 0) {
-          console.log(`Last user left room ${roomCode}. Deleting room.`);
-          // await remove(getRoomRef(roomCode)); // Uncomment to delete room
-      } else {
-          console.log(`${remainingMembers.length} members remaining in room ${roomCode}.`);
+              if (remainingOnlineMembers.length === 0) {
+                  console.log(`Last online user left room ${roomCode}. Optional: Consider deleting room.`);
+                  // await remove(getRoomRef(roomCode)); // Uncomment to delete room
+              } else {
+                  console.log(`${remainingOnlineMembers.length} online members remaining in room ${roomCode}.`);
+              }
+          } else {
+               console.log(`Members node for room ${roomCode} does not exist (already deleted or never created fully?). No cleanup needed.`);
+          }
+      } catch (readError: any) {
+          console.error(`Error reading members to check for room deletion: ${readError.message}`);
       }
 
 
     } catch (err: any) {
-      console.error("Error leaving room:", err);
-      setError(`Failed to leave room ${roomCode}: ${err.message}`);
+      // Catch any unexpected errors during the leave process itself (outside specific DB calls)
+      console.error("Unexpected error during leaveRoom process:", err);
+      setError(`An unexpected error occurred while leaving room ${roomCode}: ${err.message}`);
       // Don't re-throw here, just log the error. Cleanup will happen anyway.
     } finally {
        // 4. Clean up listeners and reset state regardless of success/failure
        cleanupListeners();
-       setCurrentUser(null); // Clear current user state *after* DB operations
+       setCurrentUser(null); // Clear current user state *after* DB operations attempt
        currentRoomCode.current = null;
        setLoading(false); // Finish loading state
        console.log(`Finished leaveRoom process for ${userId} in room ${roomCode}.`);
@@ -411,20 +459,38 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
       throw new Error("Cannot send message: Not connected to the room or database.");
     }
     const messagesRef = getMessagesRef(roomCode);
+    const userRef = getUserRef(roomCode, currentUser.id); // Get user ref for update
     const newMessage: Message = {
       senderId: currentUser.id,
       text: text.trim(),
       timestamp: serverTimestamp(),
     };
+
+    // Check if text is empty after trimming
+     if (!newMessage.text) {
+       console.log("Attempted to send an empty message.");
+       return; // Don't send empty messages
+     }
+
     try {
-      await push(messagesRef, newMessage);
-       // Update user's lastSeen timestamp on sending a message
-      const userRef = getUserRef(roomCode, currentUser.id);
+       // Use a single update operation for atomicity (send message + update lastSeen)
+       // Note: This structure is slightly less common; usually, push is separate.
+       // Pushing first and then updating lastSeen is also acceptable and often simpler.
+       // Let's stick to the simpler push then update pattern.
+
+       // 1. Push the new message
+      const newMessageRef = push(messagesRef); // Get ref for the new message key
+      await set(newMessageRef, newMessage); // Set the message data
+
+      // 2. Update user's lastSeen timestamp
       await update(userRef, { lastSeen: serverTimestamp() });
+
+      console.log(`Message sent by ${currentUser.id} in room ${roomCode}. Last seen updated.`);
+
     } catch (err: any) {
-      console.error("Error sending message:", err);
+      console.error("Error sending message or updating lastSeen:", err);
       setError(`Failed to send message: ${err.message}`);
-      throw err;
+      throw err; // Re-throw for the component to potentially handle
     }
   }, [db, currentUser, getMessagesRef, getUserRef]); // Added getUserRef
 
@@ -436,22 +502,28 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
     return () => {
        // This cleanup runs when the ChatProvider itself unmounts
        if (currentUser && currentRoomCode.current) {
-         console.log("ChatProvider unmounting, ensuring user leaves room:", currentRoomCode.current);
-         // Directly call the database operation part without full state updates if needed
-         // Or rely on the beforeunload handler
-         // leaveRoom(currentRoomCode.current); // Potential issue if component unmounts before DB ops complete
+         console.log("ChatProvider unmounting, initiating leaveRoom cleanup for:", currentRoomCode.current);
+         // Call leaveRoom directly - it handles its own state and cleanup
+         leaveRoom(currentRoomCode.current);
+       } else {
+          // Ensure listeners are cleaned even if no user/room was active
+          console.log("ChatProvider unmounting, running cleanupListeners.");
+          cleanupListeners();
        }
-      cleanupListeners();
     };
-  }, [currentUser, cleanupListeners]); // Removed leaveRoom dependency
+   // IMPORTANT: Include leaveRoom and cleanupListeners in dependencies
+   // Ensure currentUser is also included if its state determines leaveRoom logic
+  }, [currentUser, leaveRoom, cleanupListeners]);
 
 
    // Inactivity check (optional but good practice for cleanup)
    React.useEffect(() => {
     const interval = setInterval(async () => {
-      if (!db || !currentRoomCode.current) return;
+      if (!db || !currentRoomCode.current) return; // Only run if DB connected and in a room
 
       const currentCheckedRoom = currentRoomCode.current; // Capture the room code at the start of the interval
+      console.log(`Running inactivity check for room: ${currentCheckedRoom}`);
+
       const membersRef = getMembersRef(currentCheckedRoom);
 
 
@@ -463,60 +535,94 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
           return;
         }
 
-        const membersData = snapshot.val();
-        if (!snapshot.exists() || !membersData) {
-           // Room might have been deleted, or is empty
-           console.log(`Inactivity check: Room ${currentCheckedRoom} does not exist or has no members.`);
+        if (!snapshot.exists()) {
+           console.log(`Inactivity check: Room ${currentCheckedRoom} does not exist or is empty.`);
+           // If the *current user* thought they were in this room, trigger leave state
+           if (currentUser && currentRoomCode.current === currentCheckedRoom) {
+              console.warn(`Inactivity check found current room ${currentCheckedRoom} deleted. Forcing local leave.`);
+              setError("The room seems to have been deleted.");
+              cleanupListeners();
+              setCurrentUser(null);
+              currentRoomCode.current = null;
+              setLoading(false);
+           }
            return;
         }
 
+        const membersData = snapshot.val();
         const now = Date.now();
         let membersRemoved = false;
+        const membersToRemove: string[] = [];
 
         for (const memberId in membersData) {
           const member = membersData[memberId] as Member;
-          // Check only 'offline' members based on the onDisconnect mechanism (or very old lastSeen even if online flag is stuck)
-          if (member && typeof member.lastSeen === 'number' && (now - member.lastSeen > MEMBER_INACTIVITY_TIMEOUT)) {
-             if (!member.online) {
-                console.log(`Removing inactive (offline) member ${member.name} (${memberId}) from room ${currentCheckedRoom}. Last seen: ${new Date(member.lastSeen).toISOString()}`);
-                await remove(getUserRef(currentCheckedRoom, memberId));
-                membersRemoved = true;
-             } else {
-                // Optional: Handle cases where 'online' might be stuck true but lastSeen is very old
-                console.warn(`Member ${member.name} (${memberId}) in room ${currentCheckedRoom} is marked online but lastSeen (${new Date(member.lastSeen).toISOString()}) is older than timeout. Consider removing.`);
-                 // await remove(getUserRef(currentCheckedRoom, memberId)); // Uncomment to remove potentially stuck users
-                 // membersRemoved = true;
-             }
+          // Basic check: exists, has lastSeen as a number
+          if (member && typeof member.lastSeen === 'number') {
+            const timeSinceSeen = now - member.lastSeen;
+             // Primary condition: User is marked offline AND inactive timeout passed
+             // OR User is marked online BUT timeout is MUCH longer (e.g., 3x) indicating a stuck state
+             const isStaleOffline = !member.online && timeSinceSeen > MEMBER_INACTIVITY_TIMEOUT;
+             const isStaleOnline = member.online && timeSinceSeen > MEMBER_INACTIVITY_TIMEOUT * 3; // 15 minutes for stuck online
+
+            if (isStaleOffline || isStaleOnline) {
+                const reason = isStaleOffline ? "inactive (offline)" : "inactive (stuck online)";
+                console.log(`Scheduling removal of ${reason} member ${member.name} (${memberId}) from room ${currentCheckedRoom}. Last seen: ${new Date(member.lastSeen).toISOString()}`);
+                membersToRemove.push(memberId);
+            }
+          } else if (member) {
+             // Log members without a valid lastSeen timestamp for debugging
+             console.warn(`Member ${member.name} (${memberId}) in room ${currentCheckedRoom} has missing or invalid 'lastSeen' timestamp:`, member.lastSeen);
+             // Optional: Schedule removal if they are very old based on some other criteria? Or just log.
           }
         }
 
-         // If members were removed, re-check if the room is now empty
-        if(membersRemoved) {
-             const updatedSnapshot = await get(membersRef);
-             // Abort if room changed again
-             if (currentRoomCode.current !== currentCheckedRoom) return;
-
-             const remainingMembers = updatedSnapshot.val() ? Object.values(updatedSnapshot.val()) : [];
-             if (remainingMembers.length === 0) {
-                console.log(`Room ${currentCheckedRoom} is empty after inactivity check. Deleting room.`);
-                 // await remove(getRoomRef(currentCheckedRoom)); // Uncomment to delete room
-                 // If room is deleted, we should also clean up local state if the current user was technically still "in" it
-                 if (currentRoomCode.current === currentCheckedRoom) {
-                     // cleanupListeners(); // Might already be handled if user was marked offline
-                     // setCurrentUser(null);
-                     // currentRoomCode.current = null;
-                 }
-             }
+        // Batch remove members if any are identified
+        if (membersToRemove.length > 0) {
+            const updates: { [key: string]: null } = {};
+             membersToRemove.forEach(id => {
+                 updates[id] = null; // Setting path to null removes it
+             });
+            await update(membersRef, updates); // Perform batch removal via update
+            console.log(`Removed ${membersToRemove.length} inactive members from room ${currentCheckedRoom}.`);
+            membersRemoved = true;
         }
 
-      } catch (err) {
+
+         // If members were removed, re-check if the room is now empty
+         // This check should ideally happen *after* removal confirmation
+         if(membersRemoved) {
+             // Re-fetch the members data after removal
+             const updatedSnapshot = await get(membersRef);
+             // Abort if room changed again during the removal/re-fetch
+             if (currentRoomCode.current !== currentCheckedRoom) return;
+
+             const remainingMembers = updatedSnapshot.exists() ? Object.values(updatedSnapshot.val() || {}) : [];
+             if (remainingMembers.length === 0) {
+                console.log(`Room ${currentCheckedRoom} is empty after inactivity check. Optional: Consider deleting room.`);
+                 // await remove(getRoomRef(currentCheckedRoom)); // Uncomment to delete room
+
+                 // If the current user was in this now-empty room, clear their state
+                 if (currentUser && currentRoomCode.current === currentCheckedRoom) {
+                     console.log(`Current user was in room ${currentCheckedRoom} which became empty. Forcing local leave.`);
+                     setError("The room has become empty.");
+                     cleanupListeners();
+                     setCurrentUser(null);
+                     currentRoomCode.current = null;
+                     setLoading(false);
+                 }
+             }
+         }
+
+      } catch (err: any) {
         // Avoid setting global error for background task failures
-        console.error(`Error during inactivity check for room ${currentCheckedRoom}:`, err);
+        console.error(`Error during inactivity check for room ${currentCheckedRoom}:`, err.message || err);
       }
-    }, MEMBER_INACTIVITY_TIMEOUT / 2); // Check periodically
+    }, MEMBER_INACTIVITY_TIMEOUT / 2); // Check periodically (e.g., every 2.5 minutes)
 
     return () => clearInterval(interval);
-   }, [db, getMembersRef, getUserRef, getRoomRef]); // Added getRoomRef
+    // Add dependencies: currentUser is needed to check if the current user needs cleanup
+   }, [db, currentUser, getMembersRef, getUserRef, getRoomRef, cleanupListeners]); // Added getRoomRef, cleanupListeners, currentUser
+
 
   // --- Value ---
 
@@ -536,3 +642,4 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
 };
+
