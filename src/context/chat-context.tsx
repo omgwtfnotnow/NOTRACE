@@ -12,7 +12,7 @@ import {
   serverTimestamp,
   runTransaction,
   onDisconnect,
-  update, // Added import
+  update, // Ensure update is imported
   off,
   get,
   DatabaseReference,
@@ -356,8 +356,7 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
       await onDisconnect(userRef).cancel();
       console.log(`onDisconnect cancelled for ${userId} in room ${roomCode}.`);
 
-      // 2. Mark the user as offline immediately (or remove them)
-      // Option A: Mark as offline (keeps user in list but inactive)
+      // 2. Mark the user as offline immediately using update
       await update(userRef, { online: false, lastSeen: serverTimestamp() });
       console.log(`User ${userId} marked as offline in room ${roomCode}.`);
       // Option B: Remove the user entirely (simpler state)
@@ -523,5 +522,3 @@ export const ChatProvider = ({ children }: { children: React.ReactNode }) => {
 
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
 };
-
-
