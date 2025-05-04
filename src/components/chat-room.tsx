@@ -70,18 +70,21 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
       } else {
         // joinRoom failed (room full, doesn't exist, or other error handled internally)
         // The error message should be set by the context, retrieve it if available
-        const currentError = chatError; // Get error from context *after* join attempt
-        console.error(`Failed to join room ${roomCode}. Reason: ${currentError || 'Context error not available immediately, check toast/UI or context logs.'}`);
-        setJoinError(currentError || `Could not join room ${roomCode}. It might be full, deleted, or unavailable.`);
+        const currentContextError = chatError; // Get error from context *after* join attempt
+        const failureReason = currentContextError || `Could not join room ${roomCode}. It might be full, deleted, or unavailable.`;
+        console.error(`Failed to join room ${roomCode}. Reason: ${failureReason}`);
+        setJoinError(failureReason);
         toast({
           variant: "destructive",
           title: "Failed to Join Room",
-          description: currentError || `Could not join room ${roomCode}. Redirecting...`,
+          description: failureReason + " Redirecting...",
           duration: 5000, // Give user time to read before redirect
         });
         setIsJoining(false); // Stop showing joining indicator
         // Redirect after a short delay to allow toast visibility
-        setTimeout(() => router.push('/'), 3000);
+        setTimeout(() => {
+           if (isMounted) router.push('/');
+        }, 3000);
       }
     };
 
@@ -93,9 +96,8 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
        // Leave room logic is now handled by the ChatProvider's unmount effect
        // and the beforeunload handler
     };
-    // chatError dependency removed here as it might cause loops if errors occur during context operations after join.
-    // We explicitly fetch the error *after* the join attempt inside the effect.
-   }, [roomCode, joinRoom, router, toast, chatError]); // Added chatError back as it signals context errors
+    // Include chatError to react to context-level errors, but be mindful of potential loops.
+   }, [roomCode, joinRoom, router, toast, chatError]);
 
 
    // --- Handle Browser Close/Navigation ---
@@ -134,7 +136,7 @@ export default function ChatRoom({ roomCode }: ChatRoomProps) {
    useEffect(() => {
     // Handle errors that might occur *after* joining (e.g., listener errors)
     // Ignore errors during the initial join phase as they are handled separately
-    if (chatError && !isJoining && !joinError) {
+    if (chatError && !isJoining && !joinError) { // Check !joinError to avoid duplicate redirects/toasts
       toast({
         variant: "destructive",
         title: "Room Error",
