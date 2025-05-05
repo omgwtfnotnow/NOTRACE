@@ -36,6 +36,15 @@ const validateFirebaseConfig = (config: typeof firebaseConfig): string[] => {
       missingKeys.push(`NEXT_PUBLIC_FIREBASE_${key.replace(/([A-Z])/g, '_$1').toUpperCase()}`);
     }
   }
+  // Check if databaseURL is a valid URL if provided
+  if (config.databaseURL) {
+      try {
+          new URL(config.databaseURL);
+      } catch (_) {
+          missingKeys.push('NEXT_PUBLIC_FIREBASE_DATABASE_URL (must be a valid URL)');
+      }
+  }
+
   return missingKeys;
 };
 
@@ -66,13 +75,25 @@ export const FirebaseProvider = ({ children }: { children: React.ReactNode }) =>
     // Validate the config first
     const missingConfigKeys = validateFirebaseConfig(firebaseConfig);
     if (missingConfigKeys.length > 0) {
-      const errorMsg = `Firebase initialization failed: Missing required environment variables: ${missingConfigKeys.join(', ')}. Please ensure these are set in your Vercel deployment settings.`;
+      const errorMsg = `Firebase initialization failed: Missing or invalid required environment variables: ${missingConfigKeys.join(', ')}. Please ensure these are correctly set in your Vercel deployment settings.`;
       console.error(errorMsg);
       setError(errorMsg); // Set error state
       setApp(null); // Ensure app and db are null
       setDb(null);
       return; // Stop initialization
     }
+
+    // --- Log the config being used (REMOVE IN PRODUCTION if sensitive) ---
+    console.log("Attempting Firebase init with config:", {
+      apiKey: firebaseConfig.apiKey ? '***' : undefined, // Mask sensitive key
+      authDomain: firebaseConfig.authDomain,
+      databaseURL: firebaseConfig.databaseURL,
+      projectId: firebaseConfig.projectId,
+      storageBucket: firebaseConfig.storageBucket,
+      messagingSenderId: firebaseConfig.messagingSenderId,
+      appId: firebaseConfig.appId,
+    });
+    // --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- --- ---
 
     let firebaseApp: FirebaseApp;
     try {
@@ -96,7 +117,17 @@ export const FirebaseProvider = ({ children }: { children: React.ReactNode }) =>
       console.log("Database connected:", database.app.name);
 
     } catch (initError: any) {
-        const errorMsg = `Firebase initialization error: ${initError.message}. Please check your Firebase config and Vercel environment variables.`;
+        // Log the config again specifically on error
+        console.error("Firebase config at time of error:", {
+            apiKey: firebaseConfig.apiKey ? '***' : undefined,
+            authDomain: firebaseConfig.authDomain,
+            databaseURL: firebaseConfig.databaseURL,
+            projectId: firebaseConfig.projectId,
+            storageBucket: firebaseConfig.storageBucket,
+            messagingSenderId: firebaseConfig.messagingSenderId,
+            appId: firebaseConfig.appId,
+        });
+        const errorMsg = `Firebase initialization error: ${initError.message}. Please check your Firebase config and Vercel environment variables. Ensure Project ID and Database URL are correct.`;
         console.error(errorMsg, initError);
         setError(errorMsg);
         setApp(null);
